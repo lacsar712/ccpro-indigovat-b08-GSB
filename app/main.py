@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 
-from app.db import Base, SessionLocal, engine
+from app.db import Base, SessionLocal, engine, run_lightweight_migrations
 from app.routers import auth, pages
 from app.seed import ensure_seed_data
 
@@ -14,6 +14,8 @@ from app.seed import ensure_seed_data
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    # 既有库幂等补列/约束（dip_lots.submit_token），再跑幂等种子
+    run_lightweight_migrations(engine)
     db = SessionLocal()
     try:
         ensure_seed_data(db)

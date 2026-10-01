@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import os
+import secrets
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -43,6 +44,8 @@ def ensure_seed_data(db: Session) -> None:
     db.commit()
 
     if db.query(Workshop).first():
+        # 既有库也要保证已预备还原中缸（幂等补入）
+        ensure_reducing_vat(db)
         return
 
     w1 = Workshop(name="蓝靛湾一号坊", region="黔东南", notes="晨露还原较快")
@@ -78,13 +81,21 @@ def ensure_seed_data(db: Session) -> None:
         volumeL=Decimal("750.00"),
         status=Vat.STATUS_READY,
     )
-    db.add_all([v1, v2, v3, v4])
+    # 预备一口还原中缸，便于到达即练登记/并发
+    v5 = Vat(
+        workshop_id=w1.id,
+        code="V-03",
+        dyeType="土靛",
+        volumeL=Decimal("700.00"),
+        status=Vat.STATUS_REDUCING,
+    )
+    db.add_all([v1, v2, v3, v4, v5])
     db.flush()
 
     now = datetime.now(timezone.utc)
 
     def lots(vat_id: int, series):
-        """series: (hours_ago, meters, redox or None)"""
+        """series: (hours_ago, meters, redox or None)。种子批次各给独立提交凭证。"""
         rows = []
         for hours, meters, redox in series:
             rows.append(
@@ -93,6 +104,7 @@ def ensure_seed_data(db: Session) -> None:
                     dippedAt=now - timedelta(hours=hours),
                     clothMeters=Decimal(meters),
                     redoxMv=Decimal(redox) if redox is not None else None,
+                    submit_token=secrets.token_hex(16),
                 )
             )
         return rows
@@ -138,6 +150,42 @@ def ensure_seed_data(db: Session) -> None:
                 (20, "33.00", "-505.00"),
                 (10, "38.50", "-530.00"),
             ],
+        )
+    )
+    db.add_all(
+        lots(
+            v5.id,
+            [
+                (9, "10.00", "-360.00"),
+                (5, "14.00", "-410.00"),
+                (2, "16.00", "-455.00"),
+            ],
+        )
+    )
+    db.commit()
+
+
+def ensure_reducing_vat(db: Session) -> None:
+    """对既有库幂等补一口还原中缸（V-03），已存在则不动。"""
+    ws = db.query(Workshop).filter_by(name="蓝靛湾一号坊").first()
+    if ws is None:
+        ws = db.query(Workshop).order_by(Workshop.id).first()
+    if ws is None:
+        return
+    exists = (
+        db.query(Vat)
+        .filter(Vat.workshop_id == ws.id, Vat.code == "V-03")
+        .first()
+    )
+    if exists is not None:
+        return
+    db.add(
+        Vat(
+            workshop_id=ws.id,
+            code="V-03",
+            dyeType="土靛",
+            volumeL=Decimal("700.00"),
+            status=Vat.STATUS_REDUCING,
         )
     )
     db.commit()

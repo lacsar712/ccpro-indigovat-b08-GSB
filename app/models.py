@@ -64,11 +64,16 @@ class Vat(Base):
 
 class DipLot(Base):
     __tablename__ = "dip_lots"
+    __table_args__ = (
+        UniqueConstraint("submit_token", name="uniq_dip_lot_submit_token"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     vat_id: Mapped[int] = mapped_column(ForeignKey("vats.id", ondelete="CASCADE"))
     dippedAt: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     clothMeters: Mapped[Decimal] = mapped_column(Numeric(10, 2))
     redoxMv: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 2), nullable=True)
+    # 一笔登记的提交凭证：同凭证（连点/重复提交）只许入库一笔
+    submit_token: Mapped[str] = mapped_column(String(64))
 
     vat: Mapped["Vat"] = relationship(back_populates="lots")

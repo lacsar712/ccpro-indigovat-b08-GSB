@@ -1,7 +1,6 @@
-from datetime import datetime
-from decimal import Decimal, InvalidOperation
 from typing import Optional
 import json
+import secrets
 
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -12,6 +11,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.auth import get_current_user
 from app.db import get_db
 from app.models import DipLot, Vat, Workshop
+from app.services.dips import DipSubmissionError, DuplicateDipSubmission, log_dip_lot
 from app.services.vat_rules import VatRuleError, validate_vat_status_change
 
 router = APIRouter()
@@ -60,7 +60,8 @@ def _vat_payload(vat: Vat) -> dict:
     lots = sorted(vat.lots, key=lambda x: (x.dippedAt, x.id))
     chronological = lots
     latest = lots[-1] if lots else None
-    recent = list(reversed(lots[-8:]))  # 展开区展示近几笔
+    # 近笔：摘要计数与展开区列表必须同源同条数，均取库内全部批次，库差恒为 0
+    recent = list(reversed(lots))
     return {
         "id": vat.id,
         "code": vat.code,
@@ -74,6 +75,7 @@ def _vat_payload(vat: Vat) -> dict:
         "lastMeters": float(latest.clothMeters) if latest else None,
         "lastDippedAt": latest.dippedAt.strftime("%Y-%m-%d %H:%M") if latest else None,
         "spark": _spark_points(chronological),
+        "recentCount": len(recent),
         "recentLots": [
             {
                 "id": l.id,
@@ -111,6 +113,8 @@ def _bay_context(
         "selected_vat": selected_vat,
         "error": error,
         "status_labels": STATUS_LABELS,
+        # 每次渲染签发一枚提交凭证：同页连点/重发共用，服务端据此只入一笔
+        "submit_token": secrets.token_hex(16),
         "active": "bay",
     }
 
@@ -170,8 +174,9 @@ async def bay_vat_status(
 async def bay_log_lot(
     pk: int,
     request: Request,
-    dippedAt: str = Form(...),
-    clothMeters: str = Form(...),
+    submitToken: str = Form(""),
+    dippedAt: str = Form(""),
+    clothMeters: str = Form(""),
     redoxMv: str = Form(""),
     workshop: str = Form(""),
     db: Session = Depends(get_db),
@@ -179,30 +184,25 @@ async def bay_log_lot(
     user = _need_login(request, db)
     if not user:
         return RedirectResponse("/login", status_code=303)
-    item = db.get(Vat, pk)
     ws = int(workshop) if workshop.strip() else None
-    if not item:
-        return RedirectResponse("/", status_code=303)
-    error = None
     try:
-        lot = DipLot(
+        log_dip_lot(
+            db,
             vat_id=pk,
-            dippedAt=datetime.fromisoformat(dippedAt),
-            clothMeters=Decimal(clothMeters),
-            redoxMv=Decimal(redoxMv) if redoxMv.strip() else None,
+            submit_token=submitToken,
+            dipped_at_raw=dippedAt,
+            cloth_raw=clothMeters,
+            redox_raw=redoxMv,
         )
-        db.add(lot)
-        db.commit()
         return RedirectResponse(f"/?vat={pk}" + (f"&workshop={ws}" if ws else ""), status_code=303)
-    except (ValueError, InvalidOperation) as exc:
-        error = f"浸染记录无效：{exc}"
-        db.rollback()
-    return render(
-        request,
-        "bay.html",
-        _bay_context(request, db, user, ws, pk, error),
-        status_code=400,
-    )
+    except DipSubmissionError as exc:
+        # 服务层已保证：失败事务回滚干净，无任何半插入
+        return render(
+            request,
+            "bay.html",
+            _bay_context(request, db, user, ws, pk, exc.message),
+            status_code=409 if isinstance(exc, DuplicateDipSubmission) else 400,
+        )
 
 
 # 旧顶栏 CRUD 路径一律回到还原台，避免「换皮表页」残留入口

@@ -63,6 +63,7 @@
             <span>尚无电位</span>
           </template>
         </div>
+        <div class="lot-count" x-text="'近 ' + v.recentCount + ' 笔'"></div>
       </button>
     </template>
   </div>
@@ -83,8 +84,9 @@
         <div class="panel-grid">
           <div>
             <h3 style="font-size:1rem;margin:0 0 0.65rem;color:#1f4d6b">登记浸染</h3>
-            <form method="post" :action="'/bay/vats/' + selected().id + '/lots'">
+            <form method="post" :action="'/bay/vats/' + selected().id + '/lots'" @submit="guardDoubleSubmit($event)">
               <input type="hidden" name="workshop" :value="filterWs || ''">
+              <input type="hidden" name="submitToken" value="{{ submit_token }}">
               <label>浸染时间
                 <input type="datetime-local" name="dippedAt" required :value="nowLocal()">
               </label>
@@ -110,7 +112,10 @@
               </label>
               <button type="submit">更新状态</button>
             </form>
-            <h3 style="font-size:0.95rem;margin:1.25rem 0 0.4rem;color:#1f4d6b">近几笔浸染</h3>
+            <h3 style="font-size:0.95rem;margin:1.25rem 0 0.4rem;color:#1f4d6b">
+              近几笔浸染
+              <span class="recent-count" x-text="'(' + selected().recentCount + ')'"></span>
+            </h3>
             <ul class="lot-list">
               <template x-for="l in selected().recentLots" :key="l.id">
                 <li>
@@ -181,6 +186,19 @@
         const d = new Date();
         d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
         return d.toISOString().slice(0, 16);
+      },
+      guardDoubleSubmit(ev) {
+        // 前端先挡连点；服务端凭证 + 行锁为最终权威（刷新/重发/并发同样只入一笔）
+        const form = ev.target;
+        const btn = form.querySelector('button[type="submit"]');
+        if (btn && btn.disabled) {
+          ev.preventDefault();
+          return;
+        }
+        if (btn) {
+          btn.disabled = true;
+          btn.textContent = '写入中…';
+        }
       },
     };
   }
