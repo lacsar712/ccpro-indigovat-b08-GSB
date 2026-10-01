@@ -6,10 +6,12 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     Numeric,
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -64,6 +66,28 @@ class Vat(Base):
 
 class DipLot(Base):
     __tablename__ = "dip_lots"
+    __table_args__ = (
+        # 连点/重复提交去重：同缸 + 同浸染时间 + 同米数 + 同电位只许一笔入库。
+        # SQL 中 NULL 互不相等，故拆成两个部分唯一索引：
+        # 电位为空的按前三列判重；电位有值时把 redoxMv 一并纳入。
+        Index(
+            "uniq_dip_lot_redox_null",
+            "vat_id",
+            "dippedAt",
+            "clothMeters",
+            unique=True,
+            postgresql_where=text('"redoxMv" IS NULL'),
+        ),
+        Index(
+            "uniq_dip_lot_redox_set",
+            "vat_id",
+            "dippedAt",
+            "clothMeters",
+            "redoxMv",
+            unique=True,
+            postgresql_where=text('"redoxMv" IS NOT NULL'),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     vat_id: Mapped[int] = mapped_column(ForeignKey("vats.id", ondelete="CASCADE"))

@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from jinja2.utils import markupsafe
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from app.auth import get_current_user
@@ -60,7 +61,17 @@ def _vat_payload(vat: Vat) -> dict:
     lots = sorted(vat.lots, key=lambda x: (x.dippedAt, x.id))
     chronological = lots
     latest = lots[-1] if lots else None
+    # 展开区近笔列表与缸位摘要近笔计数必须同源于此一份列表，与库内近笔条数差恒为 0。
     recent = list(reversed(lots[-8:]))  # 展开区展示近几笔
+    recent_payload = [
+        {
+            "id": l.id,
+            "dippedAt": l.dippedAt.strftime("%Y-%m-%d %H:%M"),
+            "clothMeters": float(l.clothMeters),
+            "redoxMv": float(l.redoxMv) if l.redoxMv is not None else None,
+        }
+        for l in recent
+    ]
     return {
         "id": vat.id,
         "code": vat.code,
@@ -73,16 +84,9 @@ def _vat_payload(vat: Vat) -> dict:
         "lastRedox": float(latest.redoxMv) if latest and latest.redoxMv is not None else None,
         "lastMeters": float(latest.clothMeters) if latest else None,
         "lastDippedAt": latest.dippedAt.strftime("%Y-%m-%d %H:%M") if latest else None,
+        "recentCount": len(recent_payload),
         "spark": _spark_points(chronological),
-        "recentLots": [
-            {
-                "id": l.id,
-                "dippedAt": l.dippedAt.strftime("%Y-%m-%d %H:%M"),
-                "clothMeters": float(l.clothMeters),
-                "redoxMv": float(l.redoxMv) if l.redoxMv is not None else None,
-            }
-            for l in recent
-        ],
+        "recentLots": recent_payload,
     }
 
 
@@ -179,24 +183,62 @@ async def bay_log_lot(
     user = _need_login(request, db)
     if not user:
         return RedirectResponse("/login", status_code=303)
-    item = db.get(Vat, pk)
     ws = int(workshop) if workshop.strip() else None
-    if not item:
-        return RedirectResponse("/", status_code=303)
     error = None
+
+    # 1) 先解析表单：解析阶段不碰数据库，天然不存在半插入。
     try:
+        dipped_at = datetime.fromisoformat(dippedAt)
+        cloth_meters = Decimal(clothMeters)
+        redox_mv = Decimal(redoxMv) if redoxMv.strip() else None
+    except (ValueError, InvalidOperation) as exc:
+        db.rollback()
+        return render(
+            request,
+            "bay.html",
+            _bay_context(
+                request, db, user, ws, pk, f"浸染记录无效，未写入：{exc}"
+            ),
+            status_code=400,
+        )
+
+    # 2) 锁缸 → 查重 → 一笔插入，全部压在同一事务里：
+    #    同缸连点/重复提交在 FOR UPDATE 上排队，后到者必能看到先提交者，只许一笔入库。
+    try:
+        item = db.query(Vat).with_for_update().filter(Vat.id == pk).first()
+        if not item:
+            db.rollback()
+            return RedirectResponse("/", status_code=303)
+
+        dup_query = db.query(DipLot.id).filter(
+            DipLot.vat_id == pk,
+            DipLot.dippedAt == dipped_at,
+            DipLot.clothMeters == cloth_meters,
+        )
+        if redox_mv is None:
+            dup_query = dup_query.filter(DipLot.redoxMv.is_(None))
+        else:
+            dup_query = dup_query.filter(DipLot.redoxMv == redox_mv)
+        if dup_query.first() is not None:
+            raise VatRuleError("该浸染与本缸已有一笔完全相同，重复提交未写入。")
+
         lot = DipLot(
             vat_id=pk,
-            dippedAt=datetime.fromisoformat(dippedAt),
-            clothMeters=Decimal(clothMeters),
-            redoxMv=Decimal(redoxMv) if redoxMv.strip() else None,
+            dippedAt=dipped_at,
+            clothMeters=cloth_meters,
+            redoxMv=redox_mv,
         )
         db.add(lot)
         db.commit()
         return RedirectResponse(f"/?vat={pk}" + (f"&workshop={ws}" if ws else ""), status_code=303)
-    except (ValueError, InvalidOperation) as exc:
-        error = f"浸染记录无效：{exc}"
+    except VatRuleError as exc:
+        # 业务判重失败：整笔回滚，不留半截记录。
         db.rollback()
+        error = exc.message
+    except IntegrityError:
+        # 并发兜底：唯一索引拦下的竞态重复，同样整笔回滚。
+        db.rollback()
+        error = "该浸染与本缸已有一笔重复，本次提交未写入（仅一笔入库）。"
     return render(
         request,
         "bay.html",
